@@ -415,7 +415,6 @@ REMOTE_HTML = r"""<!DOCTYPE html>
     -webkit-tap-highlight-color: transparent;
   }
   .btn:active { transform: scale(0.9); background: rgba(255,255,255,0.1); }
-  .btn-small { width: 56px; height: 56px; }
   .btn-large { width: 80px; height: 80px; background: #fff; color: #0a0a0a; }
   .btn-large:active { background: #ccc; }
   .btn svg { width: 28px; height: 28px; }
@@ -573,14 +572,8 @@ REMOTE_HTML = r"""<!DOCTYPE html>
 <div class="now-playing" id="now-playing"></div>
 
 <div class="controls">
-  <button class="btn btn-small" onclick="sendCmd('prev')">
-    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>
-  </button>
   <button class="btn btn-large" onclick="sendCmd('play-pause')">
     <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6zm8-14v14h4V5z"/></svg>
-  </button>
-  <button class="btn btn-small" onclick="sendCmd('next')">
-    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 6v12l8.5-6z"/><path d="M16 6h2v12h-2z"/></svg>
   </button>
 </div>
 
