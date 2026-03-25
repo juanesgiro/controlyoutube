@@ -1,697 +1,204 @@
 #!/usr/bin/env python3
-"""
-Music Remote para Windows.
-Ejecuta: python server-windows.py
-En la PC abre: http://localhost:8899/player
-En el celular abre: http://<tu-ip>:8899
-"""
-
-import http.server
-import json
-import urllib.parse
-import ctypes
-import threading
+import http.server, json, urllib.parse, threading, sys
 
 PORT = 8899
 
-# Estado compartido entre el celular (remote) y la PC (player)
-state = {
-    "command": "",        # "play-pause"
-    "command_id": 0,
-    "direct_url": "",     # URL directa para reproducir
-    "direct_url_id": 0,   # ID para detectar cambios
-}
+state = {"url": "", "url_id": 0}
 lock = threading.Lock()
 
-# Volume keys
-VK_MEDIA_PLAY_PAUSE = 0xB3
-KEYEVENTF_EXTENDEDKEY = 0x0001
-KEYEVENTF_KEYUP = 0x0002
-
-def set_volume_precise(value):
-    try:
-        import subprocess
-        v = max(0, min(100, int(value))) / 100.0
-        ps2 = f"""
-Add-Type -TypeDefinition @'
-using System.Runtime.InteropServices;
-[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IAudioEndpointVolume {{
-    int _0(); int _1(); int _2(); int _3(); int _4(); int _5(); int _6();
-    int SetMasterVolumeLevelScalar(float fLevel, System.Guid pguidEventContext);
-    int GetMasterVolumeLevelScalar(out float pfLevel);
-}}
-[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDevice {{ int Activate(ref System.Guid id, int clsCtx, int a, out IAudioEndpointVolume aev); }}
-[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDeviceEnumerator {{ int GetDefaultAudioEndpoint(int flow, int role, out IMMDevice dev); }}
-[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDevEn {{}}
-public class Vol {{
-    public static void Set(float l) {{
-        var e = (IMMDeviceEnumerator)(new MMDevEn());
-        e.GetDefaultAudioEndpoint(0, 1, out IMMDevice d);
-        var iid = typeof(IAudioEndpointVolume).GUID;
-        d.Activate(ref iid, 1, 0, out IAudioEndpointVolume v);
-        v.SetMasterVolumeLevelScalar(l, System.Guid.Empty);
-    }}
-}}
-'@
-[Vol]::Set({v})
-"""
-        subprocess.run(["powershell", "-Command", ps2], capture_output=True, timeout=5)
-    except Exception:
-        pass
-
-def get_volume():
-    try:
-        import subprocess
-        ps = """
-Add-Type -TypeDefinition @'
-using System.Runtime.InteropServices;
-[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IAudioEndpointVolume {
-    int _0(); int _1(); int _2(); int _3(); int _4(); int _5(); int _6();
-    int SetMasterVolumeLevelScalar(float fLevel, System.Guid pguidEventContext);
-    int GetMasterVolumeLevelScalar(out float pfLevel);
-}
-[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDevice { int Activate(ref System.Guid id, int clsCtx, int a, out IAudioEndpointVolume aev); }
-[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDeviceEnumerator { int GetDefaultAudioEndpoint(int flow, int role, out IMMDevice dev); }
-[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDevEn {}
-public class Vol {
-    public static float Get() {
-        var e = (IMMDeviceEnumerator)(new MMDevEn());
-        e.GetDefaultAudioEndpoint(0, 1, out IMMDevice d);
-        var iid = typeof(IAudioEndpointVolume).GUID;
-        d.Activate(ref iid, 1, 0, out IAudioEndpointVolume v);
-        v.GetMasterVolumeLevelScalar(out float l);
-        return l;
-    }
-}
-'@
-[math]::Round([Vol]::Get() * 100)
-"""
-        r = subprocess.run(["powershell", "-Command", ps], capture_output=True, text=True, timeout=5)
-        return int(r.stdout.strip())
-    except Exception:
-        return 50
-
-
-def extract_video_id(url):
-    """Extrae el video ID de un link de YouTube."""
-    if "youtu.be/" in url:
-        return url.split("youtu.be/")[1].split("?")[0].split("&")[0]
-    if "youtube.com" in url:
-        parsed = urllib.parse.urlparse(url)
-        params = urllib.parse.parse_qs(parsed.query)
-        if "v" in params:
-            return params["v"][0]
-        if "list" in params:
-            return None  # playlist
-    return None
-
-def extract_playlist_id(url):
-    """Extrae el playlist ID de un link de YouTube."""
-    if "youtube.com" in url:
-        parsed = urllib.parse.urlparse(url)
-        params = urllib.parse.parse_qs(parsed.query)
-        if "list" in params:
-            return params["list"][0]
-    return None
-
-
-# ==================== PLAYER PAGE (corre en el navegador de la PC) ====================
-PLAYER_HTML = r"""<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8">
-<title>Music Player</title>
+# ==================== PLAYER (PC) ====================
+PLAYER = r"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Player</title>
 <style>
-  body { background: #111; color: #fff; font-family: sans-serif; display: flex;
-         flex-direction: column; align-items: center; justify-content: center;
-         height: 100vh; margin: 0; }
-  h1 { color: #555; font-size: 1.2em; letter-spacing: 2px; margin-bottom: 20px; }
-  #status { color: #666; font-size: 0.9em; margin-top: 10px; }
-  iframe { border-radius: 8px; }
+  body { background:#111; color:#fff; font-family:sans-serif;
+         display:flex; flex-direction:column; align-items:center;
+         justify-content:center; height:100vh; margin:0; }
+  #msg { color:#666; font-size:1em; margin-bottom:20px; }
 </style>
-</head>
-<body>
-<h1>MUSIC PLAYER</h1>
-<p id="status">Esperando comandos del celular...</p>
-<div id="player-container"><div id="yt-player"></div></div>
-
+</head><body>
+<div id="msg">Esperando...</div>
+<div id="box"><div id="yt"></div></div>
 <script>
-let player = null;
-let playerReady = false;
-let lastCommandId = 0;
-let lastDirectId = 0;
-let apiReady = false;
+let player = null, ready = false, lastId = 0;
 
 const tag = document.createElement('script');
 tag.src = "https://www.youtube.com/iframe_api";
 document.head.appendChild(tag);
 
 function onYouTubeIframeAPIReady() {
-  apiReady = true;
-  document.getElementById('status').textContent = 'Listo. Elige una cancion en el celular.';
+  document.getElementById('msg').textContent = 'Listo. Elige cancion en el celular.';
 }
 
-function getVideoId(url) {
-  if (!url) return null;
+function vid(url) {
   let m = url.match(/youtu\.be\/([^?&]+)/);
   if (m) return m[1];
   m = url.match(/[?&]v=([^&]+)/);
-  if (m) return m[1];
-  return null;
+  return m ? m[1] : null;
 }
 
-function getPlaylistId(url) {
-  if (!url) return null;
+function plist(url) {
   let m = url.match(/[?&]list=([^&]+)/);
-  if (m) return m[1];
-  return null;
+  return m ? m[1] : null;
 }
 
-function playUrl(url) {
-  if (!apiReady) return;
-  const videoId = getVideoId(url);
-  const playlistId = getPlaylistId(url);
+function play(url) {
+  const v = vid(url), p = plist(url);
 
-  // Player already exists: just load the new video
-  if (player && playerReady) {
-    if (playlistId) {
-      player.loadPlaylist({ listType: 'playlist', list: playlistId });
-    } else if (videoId) {
-      player.loadVideoById(videoId);
-    }
-    document.getElementById('status').textContent = 'Reproduciendo...';
+  if (player && ready) {
+    if (p) player.loadPlaylist({listType:'playlist', list:p});
+    else if (v) player.loadVideoById(v);
+    document.getElementById('msg').textContent = 'Reproduciendo...';
     return;
   }
 
-  // First time: create the player
   const opts = {
-    height: '360',
-    width: '640',
-    playerVars: { autoplay: 1, controls: 1, enablejsapi: 1, origin: window.location.origin },
-    events: {
-      onReady: function(e) {
-        playerReady = true;
-        document.getElementById('status').textContent = 'Reproduciendo...';
-      }
-    }
+    height:'360', width:'640',
+    playerVars:{autoplay:1, controls:1, enablejsapi:1, origin:location.origin},
+    events:{ onReady: function(){ ready = true;
+      document.getElementById('msg').textContent = 'Reproduciendo...'; }}
   };
+  if (p) { opts.playerVars.listType='playlist'; opts.playerVars.list=p; }
+  else if (v) { opts.videoId = v; }
 
-  if (playlistId) {
-    opts.playerVars.listType = 'playlist';
-    opts.playerVars.list = playlistId;
-  } else if (videoId) {
-    opts.videoId = videoId;
-  }
-
-  document.getElementById('player-container').innerHTML = '<div id="yt-player"></div>';
-  player = new YT.Player('yt-player', opts);
+  document.getElementById('box').innerHTML = '<div id="yt"></div>';
+  player = new YT.Player('yt', opts);
 }
 
-function executeCommand(cmd) {
-  if (!player || !playerReady) return;
-  try {
-    if (cmd === 'play') player.playVideo();
-    else if (cmd === 'pause') player.pauseVideo();
-    else if (cmd === 'play-pause') {
-      const st = player.getPlayerState();
-      if (st === 1) player.pauseVideo();
-      else player.playVideo();
-    }
-  } catch(e) {}
-}
-
-async function poll() {
+setInterval(async function(){
   try {
     const r = await fetch('/state');
     const d = await r.json();
-
-    if (d.direct_url && d.direct_url_id > lastDirectId) {
-      lastDirectId = d.direct_url_id;
-      playUrl(d.direct_url);
+    if (d.url && d.url_id > lastId) {
+      lastId = d.url_id;
+      play(d.url);
     }
-
-    if (d.command && d.command_id > lastCommandId) {
-      lastCommandId = d.command_id;
-      executeCommand(d.command);
-    }
-  } catch(e) {}
-}
-
-setInterval(poll, 500);
+  } catch(e){}
+}, 500);
 </script>
 </body></html>
 """
 
-
-# ==================== REMOTE PAGE (corre en el celular) ====================
-REMOTE_HTML = r"""<!DOCTYPE html>
-<html lang="es">
-<head>
+# ==================== REMOTE (CELULAR) ====================
+REMOTE = r"""<!DOCTYPE html>
+<html lang="es"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>Music Remote</title>
+<title>Control</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, system-ui, sans-serif;
-    background: #0a0a0a;
-    color: #fff;
-    min-height: 100dvh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 30px 16px;
-    user-select: none;
-    -webkit-user-select: none;
-  }
-  #title {
-    font-size: 1.1em;
-    color: #555;
-    margin-bottom: 20px;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-  }
-
-  /* --- Controles play/pause --- */
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 24px;
-    margin-bottom: 24px;
-  }
-  .btn {
-    background: none;
-    border: none;
-    color: #fff;
-    cursor: pointer;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: transform 0.1s, background 0.2s;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .btn:active { transform: scale(0.9); background: rgba(255,255,255,0.1); }
-  .btn-large { width: 80px; height: 80px; background: #fff; color: #0a0a0a; }
-  .btn-large:active { background: #ccc; }
-  .btn svg { width: 28px; height: 28px; }
-  .btn-large svg { width: 36px; height: 36px; }
-  .now-playing {
-    color: #888;
-    font-size: 0.85em;
-    margin-bottom: 8px;
-    min-height: 20px;
-    text-align: center;
-  }
-
-  /* --- Canciones guardadas --- */
-  .section-label {
-    font-size: 0.7em;
-    color: #555;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    margin-bottom: 10px;
-    width: 100%;
-    max-width: 340px;
-  }
-  .songs-list {
-    width: 100%;
-    max-width: 340px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin-bottom: 20px;
-  }
-  .song-btn {
-    display: flex;
-    align-items: center;
-    padding: 14px 16px;
-    border-radius: 12px;
-    border: 1px solid #222;
-    background: #111;
-    color: #fff;
-    font-size: 1em;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.15s;
-    -webkit-tap-highlight-color: transparent;
-    text-align: left;
-    gap: 12px;
-  }
-  .song-btn:active { background: #1db954; border-color: #1db954; transform: scale(0.98); }
-  .song-btn.playing { border-color: #1db954; background: rgba(29,185,84,0.15); }
-  .song-btn .song-icon {
-    width: 36px; height: 36px;
-    border-radius: 8px;
-    background: #222;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-  }
-  .song-btn.playing .song-icon { background: #1db954; }
-  .song-btn .song-icon svg { width: 18px; height: 18px; }
-  .song-btn .song-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .song-btn .song-delete {
-    color: #444;
-    padding: 4px 8px;
-    font-size: 1.2em;
-    border: none;
-    background: none;
-    cursor: pointer;
-  }
-  .song-btn .song-delete:active { color: #e74c3c; }
-
-  /* --- Agregar cancion --- */
-  .add-section {
-    width: 100%;
-    max-width: 340px;
-    margin-bottom: 24px;
-  }
-  .add-row {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 6px;
-  }
-  .add-row input {
-    flex: 1;
-    padding: 10px 12px;
-    border-radius: 10px;
-    border: 1px solid #333;
-    background: #111;
-    color: #fff;
-    font-size: 0.9em;
-    outline: none;
-  }
-  .add-row input:focus { border-color: #555; }
-  .add-btn {
-    padding: 10px 16px;
-    border-radius: 10px;
-    border: none;
-    background: #1db954;
-    color: #fff;
-    font-size: 0.9em;
-    font-weight: 600;
-    cursor: pointer;
-  }
-  .add-btn:active { background: #17a248; }
-
-  /* --- Volumen --- */
-  .volume {
-    margin-top: 10px;
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    width: 280px;
-  }
-  .volume svg { width: 22px; height: 22px; color: #666; flex-shrink: 0; }
-  input[type=range] {
-    -webkit-appearance: none;
-    appearance: none;
-    flex: 1;
-    height: 6px;
-    border-radius: 3px;
-    background: #333;
-    outline: none;
-  }
-  input[type=range]::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    width: 22px; height: 22px;
-    border-radius: 50%;
-    background: #fff;
-    cursor: pointer;
-  }
-  input[type=range]::-moz-range-thumb {
-    width: 22px; height: 22px;
-    border-radius: 50%;
-    background: #fff;
-    cursor: pointer;
-    border: none;
-  }
-  #vol-label {
-    color: #666;
-    font-size: 0.85em;
-    min-width: 35px;
-    text-align: center;
-  }
-  .status {
-    margin-top: 16px;
-    color: #333;
-    font-size: 0.7em;
-  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,system-ui,sans-serif;background:#0a0a0a;color:#fff;
+       min-height:100dvh;display:flex;flex-direction:column;align-items:center;
+       padding:40px 16px;user-select:none;-webkit-user-select:none}
+  h1{font-size:1em;color:#555;letter-spacing:2px;text-transform:uppercase;margin-bottom:30px}
+  .songs{width:100%;max-width:360px;display:flex;flex-direction:column;gap:10px;margin-bottom:30px}
+  .song{padding:18px 20px;border-radius:14px;border:1px solid #222;background:#111;
+        color:#fff;font-size:1.1em;font-weight:600;cursor:pointer;
+        -webkit-tap-highlight-color:transparent;transition:all .15s;text-align:left}
+  .song:active{background:#1db954;border-color:#1db954;transform:scale(.97)}
+  .add{width:100%;max-width:360px}
+  .add input{width:100%;padding:12px;border-radius:10px;border:1px solid #333;
+             background:#111;color:#fff;font-size:.9em;outline:none;margin-bottom:8px}
+  .add input:focus{border-color:#555}
+  .add-btn{width:100%;padding:14px;border-radius:10px;border:none;
+           background:#1db954;color:#fff;font-size:1em;font-weight:600;cursor:pointer}
+  .add-btn:active{background:#17a248}
+  .sep{color:#333;font-size:.7em;text-transform:uppercase;letter-spacing:1px;margin:10px 0 16px}
 </style>
-</head>
-<body>
-
-<div id="title">Music Remote</div>
-
-<!-- Now playing + Play/Pause -->
-<div class="now-playing" id="now-playing"></div>
-
-<div class="controls">
-  <button class="btn btn-large" onclick="sendCmd('play-pause')">
-    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6zm8-14v14h4V5z"/></svg>
-  </button>
+</head><body>
+<h1>Control Musica</h1>
+<div class="songs" id="songs"></div>
+<div class="sep">Agregar cancion</div>
+<div class="add">
+  <input type="text" id="name" placeholder="Nombre (ej: Reggaeton Mix)">
+  <input type="url" id="url" placeholder="Link de YouTube">
+  <button class="add-btn" onclick="add()">Guardar</button>
 </div>
-
-<!-- Canciones guardadas -->
-<div class="section-label">Canciones</div>
-<div class="songs-list" id="songs-list"></div>
-
-<!-- Agregar cancion -->
-<div class="add-section">
-  <div class="add-row">
-    <input type="text" id="add-name" placeholder="Nombre...">
-  </div>
-  <div class="add-row">
-    <input type="url" id="add-url" placeholder="Link de YouTube...">
-    <button class="add-btn" onclick="addSong()">+</button>
-  </div>
-</div>
-
-<!-- Volumen -->
-<div class="volume">
-  <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>
-  <input type="range" id="vol" min="0" max="100" value="50"
-    oninput="document.getElementById('vol-label').textContent=this.value+'%'; sendVol(this.value)">
-  <span id="vol-label">50%</span>
-</div>
-
-<div class="status" id="status">Conectando...</div>
 
 <script>
-let volTimeout;
-let currentPlaying = -1; // index of currently playing song
+function get(){try{return JSON.parse(localStorage.getItem('s')||'[]')}catch(e){return[]}}
+function save(s){localStorage.setItem('s',JSON.stringify(s))}
 
-function getSongs() {
-  try { return JSON.parse(localStorage.getItem('songs') || '[]'); } catch(e) { return []; }
-}
-
-function saveSongs(songs) {
-  localStorage.setItem('songs', JSON.stringify(songs));
-}
-
-function renderSongs() {
-  const list = document.getElementById('songs-list');
-  const songs = getSongs();
-  list.innerHTML = '';
-  songs.forEach((song, i) => {
-    const div = document.createElement('button');
-    div.className = 'song-btn' + (i === currentPlaying ? ' playing' : '');
-    div.innerHTML = `
-      <div class="song-icon">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          ${i === currentPlaying
-            ? '<path d="M6 19h4V5H6zm8-14v14h4V5z"/>'
-            : '<path d="M8 5v14l11-7z"/>'}
-        </svg>
-      </div>
-      <span class="song-name">${song.name}</span>
-    `;
-    div.onclick = (e) => {
-      if (e.target.closest('.song-delete')) return;
-      playSong(i);
-    };
-    // Long press to delete
-    let holdTimer;
-    div.addEventListener('contextmenu', (e) => {
+function render(){
+  const el=document.getElementById('songs'), s=get();
+  el.innerHTML='';
+  s.forEach((song,i)=>{
+    const b=document.createElement('button');
+    b.className='song';
+    b.textContent=song.name;
+    b.onclick=()=>fetch('/api?action=play&url='+encodeURIComponent(song.url));
+    b.addEventListener('contextmenu',e=>{
       e.preventDefault();
-      if (confirm('Borrar "' + song.name + '"?')) {
-        deleteSong(i);
-      }
+      if(confirm('Borrar "'+song.name+'"?')){s.splice(i,1);save(s);render()}
     });
-    list.appendChild(div);
+    el.appendChild(b);
   });
 }
 
-function addSong() {
-  const name = document.getElementById('add-name').value.trim();
-  const url = document.getElementById('add-url').value.trim();
-  if (!name || !url) {
-    alert('Escribe un nombre y pega un link de YouTube');
-    return;
-  }
-  const songs = getSongs();
-  songs.push({ name, url });
-  saveSongs(songs);
-  document.getElementById('add-name').value = '';
-  document.getElementById('add-url').value = '';
-  renderSongs();
+function add(){
+  const n=document.getElementById('name').value.trim();
+  const u=document.getElementById('url').value.trim();
+  if(!n||!u){alert('Pon nombre y link');return}
+  const s=get();s.push({name:n,url:u});save(s);
+  document.getElementById('name').value='';
+  document.getElementById('url').value='';
+  render();
 }
 
-function deleteSong(index) {
-  const songs = getSongs();
-  songs.splice(index, 1);
-  saveSongs(songs);
-  if (currentPlaying === index) currentPlaying = -1;
-  else if (currentPlaying > index) currentPlaying--;
-  renderSongs();
-}
-
-async function playSong(index) {
-  const songs = getSongs();
-  if (index < 0 || index >= songs.length) return;
-  const song = songs[index];
-  currentPlaying = index;
-  document.getElementById('now-playing').textContent = song.name;
-  renderSongs();
-  try {
-    await fetch('/api?action=play-direct&url=' + encodeURIComponent(song.url));
-    document.getElementById('status').textContent = 'Conectado';
-  } catch(e) {
-    document.getElementById('status').textContent = 'Sin conexion';
-  }
-}
-
-async function sendCmd(cmd) {
-  try {
-    await fetch('/api?action=command&cmd=' + cmd);
-    document.getElementById('status').textContent = 'Conectado';
-  } catch(e) {
-    document.getElementById('status').textContent = 'Sin conexion';
-  }
-}
-
-function sendVol(v) {
-  clearTimeout(volTimeout);
-  volTimeout = setTimeout(() => fetch('/api?action=volume&value=' + v), 200);
-}
-
-async function poll() {
-  try {
-    const r = await fetch('/api?action=status');
-    const d = await r.json();
-    if (d.volume !== undefined) {
-      document.getElementById('vol').value = d.volume;
-      document.getElementById('vol-label').textContent = d.volume + '%';
-    }
-    document.getElementById('status').textContent = 'Conectado';
-  } catch(e) {
-    document.getElementById('status').textContent = 'Sin conexion';
-  }
-}
-
-window.onload = function() {
-  renderSongs();
-  poll();
-};
-
-setInterval(poll, 5000);
+render();
 </script>
 </body></html>
 """
 
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass
-
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self,*a): pass
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-
-        if parsed.path == "/api":
-            params = urllib.parse.parse_qs(parsed.query)
-            action = params.get("action", ["status"])[0]
-
-            with lock:
-                if action == "play-direct":
-                    url = params.get("url", [""])[0]
-                    if url:
-                        state["direct_url"] = url
-                        state["direct_url_id"] += 1
-
-                elif action == "command":
-                    cmd = params.get("cmd", [""])[0]
-                    state["command"] = cmd
-                    state["command_id"] += 1
-
-                elif action == "volume":
-                    val = params.get("value", ["50"])[0]
-                    set_volume_precise(val)
-
-            data = {"ok": True}
-            if action == "status":
-                data["volume"] = get_volume()
-
+        p = urllib.parse.urlparse(self.path)
+        if p.path == "/api":
+            q = urllib.parse.parse_qs(p.query)
+            a = q.get("action",[""])[0]
+            if a == "play":
+                url = q.get("url",[""])[0]
+                if url:
+                    with lock:
+                        state["url"] = url
+                        state["url_id"] += 1
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode())
-
-        elif parsed.path == "/state":
-            with lock:
-                data = dict(state)
+            self.wfile.write(b'{"ok":true}')
+        elif p.path == "/state":
+            with lock: d = dict(state)
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type","application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode())
-
-        elif parsed.path == "/player":
+            self.wfile.write(json.dumps(d).encode())
+        elif p.path == "/player":
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type","text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(PLAYER_HTML.encode())
-
+            self.wfile.write(PLAYER.encode())
         else:
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type","text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(REMOTE_HTML.encode())
-
+            self.wfile.write(REMOTE.encode())
 
 if __name__ == "__main__":
     import socket
-    import webbrowser
     ip = ""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("1.1.1.1", 80))
         ip = s.getsockname()[0]
         s.close()
-    except Exception:
-        ip = "tu-ip"
-
-    print(f"Music Remote corriendo!")
-    print(f"")
-    print(f"EN ESTA PC abre:    http://localhost:{PORT}/player")
+    except: ip = "tu-ip"
+    print(f"EN LA PC abre:      http://localhost:{PORT}/player")
     print(f"EN EL CELULAR abre: http://{ip}:{PORT}")
-    print(f"")
     print(f"(Ctrl+C para detener)")
-
-    # Abrir player solo si no hay argumento --no-open
     if "--no-open" not in sys.argv:
         import webbrowser
         webbrowser.open(f"http://localhost:{PORT}/player")
-
-    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nApagado.")
-        server.server_close()
+    srv = http.server.HTTPServer(("0.0.0.0", PORT), H)
+    try: srv.serve_forever()
+    except KeyboardInterrupt: print("\nApagado."); srv.server_close()
