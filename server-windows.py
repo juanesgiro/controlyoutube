@@ -241,10 +241,11 @@ function loadPlayer(which, url) {
 function switchMode(mode) {
   pendingMode = mode;
 
+  // Stop ALL players first
+  if (playerMi && playerMiReady) try { playerMi.stopVideo(); } catch(e) {}
+  if (playerCl && playerClReady) try { playerCl.stopVideo(); } catch(e) {}
+
   if (mode === 'mi') {
-    if (playerCl && playerClReady) {
-      try { playerCl.pauseVideo(); } catch(e) {}
-    }
     if (playerMi && playerMiReady) {
       try { playerMi.playVideo(); } catch(e) {}
       currentMode = mode;
@@ -252,9 +253,6 @@ function switchMode(mode) {
     document.getElementById('label-mi').className = 'label active-label';
     document.getElementById('label-cl').className = 'label';
   } else if (mode === 'cl') {
-    if (playerMi && playerMiReady) {
-      try { playerMi.pauseVideo(); } catch(e) {}
-    }
     if (playerCl && playerClReady) {
       try { playerCl.playVideo(); } catch(e) {}
       currentMode = mode;
@@ -278,11 +276,22 @@ function playDirectUrl(url) {
   const videoId = getVideoId(url);
   const playlistId = getPlaylistId(url);
 
-  // Pause both players first
-  if (playerMi && playerMiReady) try { playerMi.pauseVideo(); } catch(e) {}
-  if (playerCl && playerClReady) try { playerCl.pauseVideo(); } catch(e) {}
+  // If player already exists, stop it and load new video
+  if (playerMi && playerMiReady) {
+    try { playerMi.stopVideo(); } catch(e) {}
+    if (playlistId) {
+      try { playerMi.loadPlaylist({ listType: 'playlist', list: playlistId }); } catch(e) {}
+    } else if (videoId) {
+      try { playerMi.loadVideoById(videoId); } catch(e) {}
+    }
+    document.getElementById('status').textContent = 'Reproduciendo...';
+    return;
+  }
 
-  // Load in "mi" player slot
+  // Also stop the other player
+  if (playerCl && playerClReady) try { playerCl.stopVideo(); } catch(e) {}
+
+  // First time: create the player
   const opts = {
     height: '250',
     width: '350',
@@ -291,9 +300,6 @@ function playDirectUrl(url) {
       onReady: function(e) {
         playerMiReady = true;
         currentMode = 'mi';
-        e.target.playVideo();
-        document.getElementById('label-mi').className = 'label active-label';
-        document.getElementById('label-cl').className = 'label';
         document.getElementById('status').textContent = 'Reproduciendo...';
       }
     }
