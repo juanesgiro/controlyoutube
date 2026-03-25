@@ -16,10 +16,7 @@ PORT = 8899
 
 # Estado compartido entre el celular (remote) y la PC (player)
 state = {
-    "mode": "",           # "mi" o "cl"
-    "url_mi": "",
-    "url_cl": "",
-    "command": "",        # "play", "pause", "next", "prev"
+    "command": "",        # "play-pause"
     "command_id": 0,
     "direct_url": "",     # URL directa para reproducir
     "direct_url_id": 0,   # ID para detectar cambios
@@ -135,49 +132,28 @@ PLAYER_HTML = r"""<!DOCTYPE html>
          height: 100vh; margin: 0; }
   h1 { color: #555; font-size: 1.2em; letter-spacing: 2px; margin-bottom: 20px; }
   #status { color: #666; font-size: 0.9em; margin-top: 10px; }
-  #players { display: flex; gap: 20px; }
-  .player-box { text-align: center; }
-  .player-box .label { color: #666; font-size: 0.8em; margin-bottom: 8px; }
   iframe { border-radius: 8px; }
-  .active-label { color: #1db954; font-weight: bold; }
 </style>
 </head>
 <body>
 <h1>MUSIC PLAYER</h1>
 <p id="status">Esperando comandos del celular...</p>
-
-<div id="players">
-  <div class="player-box">
-    <div class="label" id="label-mi">Mi Musica</div>
-    <div id="container-mi"><div id="yt-mi"></div></div>
-  </div>
-  <div class="player-box">
-    <div class="label" id="label-cl">Clientes</div>
-    <div id="container-cl"><div id="yt-cl"></div></div>
-  </div>
-</div>
+<div id="player-container"><div id="yt-player"></div></div>
 
 <script>
-let playerMi = null;
-let playerCl = null;
-let playerMiReady = false;
-let playerClReady = false;
-let currentMode = '';
+let player = null;
+let playerReady = false;
 let lastCommandId = 0;
 let lastDirectId = 0;
-let urlMi = '';
-let urlCl = '';
-let pendingMode = '';
 let apiReady = false;
 
-// Load YouTube IFrame API
 const tag = document.createElement('script');
 tag.src = "https://www.youtube.com/iframe_api";
 document.head.appendChild(tag);
 
 function onYouTubeIframeAPIReady() {
   apiReady = true;
-  document.getElementById('status').textContent = 'YouTube listo. Pega links en el celular.';
+  document.getElementById('status').textContent = 'Listo. Elige una cancion en el celular.';
 }
 
 function getVideoId(url) {
@@ -196,110 +172,30 @@ function getPlaylistId(url) {
   return null;
 }
 
-function loadPlayer(which, url) {
+function playUrl(url) {
   if (!apiReady) return;
   const videoId = getVideoId(url);
   const playlistId = getPlaylistId(url);
 
-  const opts = {
-    height: '250',
-    width: '350',
-    playerVars: { autoplay: 0, controls: 1, enablejsapi: 1, origin: window.location.origin },
-    events: {
-      onReady: function(e) {
-        if (which === 'mi') {
-          playerMiReady = true;
-          if (pendingMode === 'mi') switchMode('mi');
-        } else {
-          playerClReady = true;
-          if (pendingMode === 'cl') switchMode('cl');
-        }
-      }
-    }
-  };
-
-  if (playlistId) {
-    opts.playerVars.listType = 'playlist';
-    opts.playerVars.list = playlistId;
-  } else if (videoId) {
-    opts.videoId = videoId;
-  }
-
-  if (which === 'mi') {
-    if (playerMi) { try { playerMi.destroy(); } catch(e) {} }
-    playerMiReady = false;
-    document.getElementById('container-mi').innerHTML = '<div id="yt-mi"></div>';
-    playerMi = new YT.Player('yt-mi', opts);
-  } else {
-    if (playerCl) { try { playerCl.destroy(); } catch(e) {} }
-    playerClReady = false;
-    document.getElementById('container-cl').innerHTML = '<div id="yt-cl"></div>';
-    playerCl = new YT.Player('yt-cl', opts);
-  }
-}
-
-function switchMode(mode) {
-  pendingMode = mode;
-
-  // Stop ALL players first
-  if (playerMi && playerMiReady) try { playerMi.stopVideo(); } catch(e) {}
-  if (playerCl && playerClReady) try { playerCl.stopVideo(); } catch(e) {}
-
-  if (mode === 'mi') {
-    if (playerMi && playerMiReady) {
-      try { playerMi.playVideo(); } catch(e) {}
-      currentMode = mode;
-    }
-    document.getElementById('label-mi').className = 'label active-label';
-    document.getElementById('label-cl').className = 'label';
-  } else if (mode === 'cl') {
-    if (playerCl && playerClReady) {
-      try { playerCl.playVideo(); } catch(e) {}
-      currentMode = mode;
-    }
-    document.getElementById('label-cl').className = 'label active-label';
-    document.getElementById('label-mi').className = 'label';
-  }
-  document.getElementById('status').textContent = 'Modo: ' + (mode === 'mi' ? 'Mi Musica' : 'Clientes');
-}
-
-function getActivePlayer() {
-  if (currentMode === 'mi' && playerMiReady) return playerMi;
-  if (currentMode === 'cl' && playerClReady) return playerCl;
-  if (playerMiReady) return playerMi;
-  if (playerClReady) return playerCl;
-  return null;
-}
-
-function playDirectUrl(url) {
-  if (!apiReady) return;
-  const videoId = getVideoId(url);
-  const playlistId = getPlaylistId(url);
-
-  // If player already exists, stop it and load new video
-  if (playerMi && playerMiReady) {
-    try { playerMi.stopVideo(); } catch(e) {}
+  // Player already exists: just load the new video
+  if (player && playerReady) {
     if (playlistId) {
-      try { playerMi.loadPlaylist({ listType: 'playlist', list: playlistId }); } catch(e) {}
+      player.loadPlaylist({ listType: 'playlist', list: playlistId });
     } else if (videoId) {
-      try { playerMi.loadVideoById(videoId); } catch(e) {}
+      player.loadVideoById(videoId);
     }
     document.getElementById('status').textContent = 'Reproduciendo...';
     return;
   }
 
-  // Also stop the other player
-  if (playerCl && playerClReady) try { playerCl.stopVideo(); } catch(e) {}
-
   // First time: create the player
   const opts = {
-    height: '250',
-    width: '350',
+    height: '360',
+    width: '640',
     playerVars: { autoplay: 1, controls: 1, enablejsapi: 1, origin: window.location.origin },
     events: {
       onReady: function(e) {
-        playerMiReady = true;
-        currentMode = 'mi';
+        playerReady = true;
         document.getElementById('status').textContent = 'Reproduciendo...';
       }
     }
@@ -312,57 +208,37 @@ function playDirectUrl(url) {
     opts.videoId = videoId;
   }
 
-  if (playerMi) { try { playerMi.destroy(); } catch(e) {} }
-  playerMiReady = false;
-  document.getElementById('container-mi').innerHTML = '<div id="yt-mi"></div>';
-  playerMi = new YT.Player('yt-mi', opts);
+  document.getElementById('player-container').innerHTML = '<div id="yt-player"></div>';
+  player = new YT.Player('yt-player', opts);
 }
 
 function executeCommand(cmd) {
-  const p = getActivePlayer();
-  if (!p) return;
+  if (!player || !playerReady) return;
   try {
-    if (cmd === 'play') p.playVideo();
-    else if (cmd === 'pause') p.pauseVideo();
+    if (cmd === 'play') player.playVideo();
+    else if (cmd === 'pause') player.pauseVideo();
     else if (cmd === 'play-pause') {
-      const st = p.getPlayerState();
-      if (st === 1) p.pauseVideo();
-      else p.playVideo();
+      const st = player.getPlayerState();
+      if (st === 1) player.pauseVideo();
+      else player.playVideo();
     }
-    else if (cmd === 'next') p.nextVideo();
-    else if (cmd === 'prev') p.previousVideo();
   } catch(e) {}
 }
 
-// Poll server for commands
 async function poll() {
   try {
     const r = await fetch('/state');
     const d = await r.json();
 
-    if (d.url_mi && d.url_mi !== urlMi) {
-      urlMi = d.url_mi;
-      loadPlayer('mi', urlMi);
-    }
-    if (d.url_cl && d.url_cl !== urlCl) {
-      urlCl = d.url_cl;
-      loadPlayer('cl', urlCl);
-    }
-
-    if (d.mode && d.mode !== currentMode) {
-      switchMode(d.mode);
-    }
-
     if (d.direct_url && d.direct_url_id > lastDirectId) {
       lastDirectId = d.direct_url_id;
-      playDirectUrl(d.direct_url);
+      playUrl(d.direct_url);
     }
 
     if (d.command && d.command_id > lastCommandId) {
       lastCommandId = d.command_id;
       executeCommand(d.command);
     }
-
   } catch(e) {}
 }
 
@@ -743,19 +619,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             action = params.get("action", ["status"])[0]
 
             with lock:
-                if action == "set-url":
-                    t = params.get("type", [""])[0]
-                    url = params.get("url", [""])[0]
-                    if t == "mi":
-                        state["url_mi"] = url
-                    elif t == "cl":
-                        state["url_cl"] = url
-
-                elif action == "switch-mode":
-                    mode = params.get("mode", [""])[0]
-                    state["mode"] = mode
-
-                elif action == "play-direct":
+                if action == "play-direct":
                     url = params.get("url", [""])[0]
                     if url:
                         state["direct_url"] = url
